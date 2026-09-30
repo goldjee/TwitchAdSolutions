@@ -45,6 +45,8 @@ https://github.com/pixeltris/TwitchAdSolutions/blob/9cae451c04a9a94859da7de19c36
 - If you don't want to use this and would like to fix the buffering manually yourself you can set `PlayerBufferingFix` to `false`.
 - Setting `AlwaysReloadPlayerOnAd` to `true` may reduce freezing issues when entering into ads.
 
+Repeating / stuttering audio during ads is mitigated by `PlaylistContinuityFix`, which stops the player from being given segments it has already played when the script switches between m3u8 sources. `KeepPlaylistSessionId` also keeps the playlist session id the same across those switches. If either causes problems, set it to `false`. The console logs `Playlist continuity: ...` whenever segments are skipped or held back.
+
 ## `video-swap-new`
 
 ### Freezing / buffering during ads

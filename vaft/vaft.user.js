@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (vaft)
 // @namespace    https://github.com/pixeltris/TwitchAdSolutions
-// @version      37.0.0
+// @version      38.0.0
 // @description  Multiple solutions for blocking Twitch ads (vaft)
-// @updateURL    https://github.com/pixeltris/TwitchAdSolutions/raw/master/vaft/vaft.user.js
-// @downloadURL  https://github.com/pixeltris/TwitchAdSolutions/raw/master/vaft/vaft.user.js
+// @updateURL    https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
+// @downloadURL  https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
 // @author       https://github.com/cleanlock/VideoAdBlockForTwitch#credits
 // @match        *://*.twitch.tv/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
 // ==/UserScript==
 (function() {
     'use strict';
-    const ourTwitchAdSolutionsVersion = 24;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 25;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping vaft as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
         window.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
@@ -53,6 +53,8 @@
         scope.PlayerBufferingMinRepeatDelay = 8000;// Minimum delay (in milliseconds) between each pause/play (this is to avoid over pressing pause/play when there are genuine buffering problems)
         scope.PlayerBufferingPrerollCheckEnabled = false;// Enable this if you're getting an immediate pause/play/reload as you open a stream (which is causing the stream to take longer to load). One problem with this being true is that it can cause the player to get stuck in some instances requiring the user to press pause/play
         scope.PlayerBufferingPrerollCheckOffset = 5;// How far the stream need to move before doing the buffering mitigation (depends on PlayerBufferingPrerollCheckEnabled being true)
+        scope.PlaylistContinuityFix = true;// If true this will avoid giving the player segments it has already played when switching between m3u8 sources (fixes repeating / stuttering audio during ads)
+        scope.KeepPlaylistSessionId = true;// If true this will keep the same playlist session id when switching between m3u8 sources (depends on PlaylistContinuityFix being true)
         scope.V2API = false;
         scope.IsAdStrippingEnabled = true;
         scope.AdSegmentCache = new Map();
@@ -133,6 +135,7 @@
                 const newBlobStr = `
                     const pendingFetchRequests = new Map();
                     ${stripAdSegments.toString()}
+                    ${ensurePlaylistContinuity.toString()}
                     ${getStreamUrlForResolution.toString()}
                     ${processM3U8.toString()}
                     ${hookWorkerFetch.toString()}
@@ -308,7 +311,8 @@
                                         ActiveBackupPlayerType: null,
                                         IsMidroll: false,
                                         IsStrippingAdSegments: false,
-                                        NumStrippedAdSegments: 0
+                                        NumStrippedAdSegments: 0,
+                                        PlaylistStates: []// xxx.m3u8 -> segments handed to the player (see ensurePlaylistContinuity)
                                     };
                                     const lines = encodingsM3u8.replaceAll('\r', '').split('\n');
                                     for (let i = 0; i < lines.length - 1; i++) {
@@ -357,6 +361,7 @@
                                     }
                                 }
                                 streamInfo.LastPlayerReload = Date.now();
+                                streamInfo.PlaylistStates = [];// New player instance, it needs the full playlists again
                                 resolve(new Response(replaceServerTimeInM3u8(streamInfo.IsUsingModifiedM3U8 ? streamInfo.ModifiedM3U8 : streamInfo.EncodingsM3U8, serverTime)));
                             } else {
                                 resolve(response);
@@ -429,6 +434,114 @@
             }
         });
         return lines.join('\n');
+    }
+    function ensurePlaylistContinuity(streamInfo, url, textStr) {
+        // Each m3u8 source (main / backup player types / fresh access tokens) lists the same segments (same media sequence) but under different urls and a different session.
+        // When the source changes the player can treat the whole playlist window as new segments and play them again (repeating / stuttering audio).
+        // To avoid this we remove segments which were already given to the player under a different url.
+        if (!PlaylistContinuityFix) {
+            return textStr;
+        }
+        let state = streamInfo.PlaylistStates[url];
+        if (!state) {
+            state = streamInfo.PlaylistStates[url] = {
+                LastSeq: -1,
+                LastText: null,
+                SessionId: null,
+                ServedUrls: new Map()// media sequence -> segment url
+            };
+        }
+        const lines = textStr.replaceAll('\r', '').split('\n');
+        let mediaSequence = NaN;
+        const segments = [];
+        let segmentStart = -1;
+        let segmentDuration = 0;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+                mediaSequence = parseInt(line.substring(line.indexOf(':') + 1));
+            } else if (line.startsWith('#EXTINF:') || line.startsWith('#EXT-X-PROGRAM-DATE-TIME:') || line == '#EXT-X-DISCONTINUITY') {
+                if (segmentStart == -1) {
+                    segmentStart = i;
+                }
+                if (line.startsWith('#EXTINF:')) {
+                    segmentDuration = parseFloat(line.substring(line.indexOf(':') + 1)) || 0;
+                }
+            } else if (segmentStart != -1 && line && !line.startsWith('#')) {
+                segments.push({
+                    Seq: mediaSequence + segments.length,
+                    Start: segmentStart,
+                    End: i,
+                    Url: line.trim(),
+                    Duration: segmentDuration
+                });
+                segmentStart = -1;
+                segmentDuration = 0;
+            }
+        }
+        if (Number.isNaN(mediaSequence) || segments.length == 0) {
+            return textStr;
+        }
+        // Drop everything up to the last segment which was already given to the player under a different url (this keeps the remaining segments sequential)
+        let dropCount = 0;
+        for (let i = 0; i < segments.length; i++) {
+            if (segments[i].Seq <= state.LastSeq && state.ServedUrls.get(segments[i].Seq) !== segments[i].Url) {
+                dropCount = i + 1;
+            }
+        }
+        if (dropCount == segments.length) {
+            // The new source is behind what the player already has. Give it the previous playlist so it waits for new segments
+            console.log('Playlist continuity: holding back ' + dropCount + ' already played segments');
+            return state.LastText || textStr;
+        }
+        if (dropCount > 0) {
+            console.log('Playlist continuity: skipped ' + dropCount + ' already played segments');
+            let droppedDuration = 0;
+            for (let i = 0; i < dropCount; i++) {
+                droppedDuration += segments[i].Duration;
+                for (let j = segments[i].Start; j <= segments[i].End; j++) {
+                    // Keep other tags (e.g. EXT-X-DATERANGE) as they describe the playlist rather than the segment
+                    if (lines[j].startsWith('#EXTINF:') || lines[j].startsWith('#EXT-X-PROGRAM-DATE-TIME:') || lines[j] == '#EXT-X-DISCONTINUITY' || (lines[j] && !lines[j].startsWith('#'))) {
+                        lines[j] = null;
+                    }
+                }
+            }
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (line === null) {
+                    continue;
+                }
+                if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+                    lines[i] = '#EXT-X-MEDIA-SEQUENCE:' + segments[dropCount].Seq;
+                } else if (line.startsWith('#EXT-X-TWITCH-LIVE-SEQUENCE:')) {
+                    lines[i] = '#EXT-X-TWITCH-LIVE-SEQUENCE:' + (parseInt(line.substring(line.indexOf(':') + 1)) + dropCount);
+                } else if (line.startsWith('#EXT-X-TWITCH-ELAPSED-SECS:')) {
+                    lines[i] = '#EXT-X-TWITCH-ELAPSED-SECS:' + (parseFloat(line.substring(line.indexOf(':') + 1)) + droppedDuration).toFixed(3);
+                }
+            }
+        }
+        let result = lines.filter((line) => line !== null).join('\n');
+        if (KeepPlaylistSessionId) {
+            const sessionIdMatch = result.match(/X-TV-TWITCH-SESSIONID="([^"]*)"/);
+            if (sessionIdMatch) {
+                if (state.SessionId === null) {
+                    state.SessionId = sessionIdMatch[1];
+                } else if (state.SessionId != sessionIdMatch[1]) {
+                    result = result.replaceAll(/(X-TV-TWITCH-SESSIONID=")[^"]*(")/g, `$1${state.SessionId}$2`);
+                }
+            }
+        }
+        for (let i = dropCount; i < segments.length; i++) {
+            state.ServedUrls.set(segments[i].Seq, segments[i].Url);
+        }
+        for (const seq of state.ServedUrls.keys()) {
+            if (seq < segments[dropCount].Seq) {
+                state.ServedUrls.delete(seq);
+            }
+        }
+        state.LastSeq = Math.max(state.LastSeq, segments[segments.length - 1].Seq);
+        state.LastText = result;
+        return result;
     }
     function getStreamUrlForResolution(encodingsM3u8, resolutionInfo) {
         const encodingsLines = encodingsM3u8.replaceAll('\r', '').split('\n');
@@ -515,12 +628,24 @@
             let fallbackM3u8 = null;
             let startIndex = 0;
             let isDoingMinimalRequests = false;
-            if (streamInfo.LastPlayerReload > Date.now() - PlayerReloadMinimalRequestsTime) {
+            const activeBackupPlayerTypeIndex = BackupPlayerTypes.indexOf(streamInfo.ActiveBackupPlayerType);
+            if (streamInfo.LastPlayerReload > Date.now() - PlayerReloadMinimalRequestsTime && activeBackupPlayerTypeIndex == -1) {
                 // When doing player reload there are a lot of requests which causes the backup stream to load in slow. Briefly prefer using a single version to prevent long delays
                 startIndex = PlayerReloadMinimalRequestsPlayerIndex;
                 isDoingMinimalRequests = true;
             }
-            for (let playerTypeIndex = startIndex; !backupM3u8 && playerTypeIndex < BackupPlayerTypes.length; playerTypeIndex++) {
+            // Try the currently active backup player type first. Switching between m3u8 sources during an ad causes playback problems
+            const playerTypeOrder = [];
+            if (activeBackupPlayerTypeIndex >= startIndex) {
+                playerTypeOrder.push(activeBackupPlayerTypeIndex);
+            }
+            for (let playerTypeIndex = startIndex; playerTypeIndex < BackupPlayerTypes.length; playerTypeIndex++) {
+                if (playerTypeIndex != activeBackupPlayerTypeIndex) {
+                    playerTypeOrder.push(playerTypeIndex);
+                }
+            }
+            for (let orderIndex = 0; !backupM3u8 && orderIndex < playerTypeOrder.length; orderIndex++) {
+                const playerTypeIndex = playerTypeOrder[orderIndex];
                 const playerType = BackupPlayerTypes[playerTypeIndex];
                 const realPlayerType = playerType.replace('-CACHED', '');
                 const isFullyCachedPlayerType = playerType != realPlayerType;
@@ -554,7 +679,7 @@
                                     if (playerType == FallbackPlayerType) {
                                         fallbackM3u8 = m3u8Text;
                                     }
-                                    if ((!m3u8Text.includes(AdSignifier) && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) || (!fallbackM3u8 && playerTypeIndex >= BackupPlayerTypes.length - 1)) {
+                                    if ((!m3u8Text.includes(AdSignifier) && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) || (!fallbackM3u8 && orderIndex >= playerTypeOrder.length - 1)) {
                                         backupPlayerType = playerType;
                                         backupM3u8 = m3u8Text;
                                         break;
@@ -618,7 +743,7 @@
             isStrippingAdSegments: streamInfo.IsStrippingAdSegments,
             numStrippedAdSegments: streamInfo.NumStrippedAdSegments
         });
-        return textStr;
+        return ensurePlaylistContinuity(streamInfo, url, textStr);
     }
     function parseAttributes(str) {
         return Object.fromEntries(
