@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (vaft)
 // @namespace    https://github.com/pixeltris/TwitchAdSolutions
-// @version      38.0.0
+// @version      38.1.0
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @updateURL    https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
 // @downloadURL  https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
@@ -436,9 +436,10 @@
         return lines.join('\n');
     }
     function ensurePlaylistContinuity(streamInfo, url, textStr) {
-        // Each m3u8 source (main / backup player types / fresh access tokens) lists the same segments (same media sequence) but under different urls and a different session.
-        // When the source changes the player can treat the whole playlist window as new segments and play them again (repeating / stuttering audio).
-        // To avoid this we remove segments which were already given to the player under a different url.
+        // Each m3u8 source (main / backup player types / fresh access tokens) lists the same segments but under different urls and a different session.
+        // A session which has had ads stitched into it also numbers its segments (EXT-X-MEDIA-SEQUENCE) on its own, so only EXT-X-TWITCH-LIVE-SEQUENCE is shared between sources.
+        // When the source changes the player can treat the whole playlist window as new segments and play them again (repeating audio / audio from the past).
+        // To avoid this we give the player one consistent numbering and remove segments which were already given to the player under a different url.
         if (!PlaylistContinuityFix) {
             return textStr;
         }
@@ -448,11 +449,16 @@
                 LastSeq: -1,
                 LastText: null,
                 SessionId: null,
-                ServedUrls: new Map()// media sequence -> segment url
+                SeqOffset: null,// player media sequence - live sequence
+                LastSourceSeqOffset: null,
+                SessionSeqOffsets: new Map(),// session id -> media sequence - live sequence
+                ServedUrls: new Map()// player media sequence -> segment url
             };
         }
         const lines = textStr.replaceAll('\r', '').split('\n');
         let mediaSequence = NaN;
+        let liveSequence = NaN;
+        let isAllLive = true;
         const segments = [];
         let segmentStart = -1;
         let segmentDuration = 0;
@@ -460,16 +466,21 @@
             const line = lines[i];
             if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
                 mediaSequence = parseInt(line.substring(line.indexOf(':') + 1));
+            } else if (line.startsWith('#EXT-X-TWITCH-LIVE-SEQUENCE:')) {
+                liveSequence = parseInt(line.substring(line.indexOf(':') + 1));
             } else if (line.startsWith('#EXTINF:') || line.startsWith('#EXT-X-PROGRAM-DATE-TIME:') || line == '#EXT-X-DISCONTINUITY') {
                 if (segmentStart == -1) {
                     segmentStart = i;
                 }
                 if (line.startsWith('#EXTINF:')) {
                     segmentDuration = parseFloat(line.substring(line.indexOf(':') + 1)) || 0;
+                    if (!line.includes(',live')) {
+                        isAllLive = false;
+                    }
                 }
             } else if (segmentStart != -1 && line && !line.startsWith('#')) {
                 segments.push({
-                    Seq: mediaSequence + segments.length,
+                    Seq: 0,
                     Start: segmentStart,
                     End: i,
                     Url: line.trim(),
@@ -481,6 +492,32 @@
         }
         if (Number.isNaN(mediaSequence) || segments.length == 0) {
             return textStr;
+        }
+        const sourceSessionId = textStr.match(/X-TV-TWITCH-SESSIONID="([^"]*)"/)?.[1];
+        let sourceSeqOffset = null;
+        if (!Number.isNaN(liveSequence) && isAllLive) {
+            sourceSeqOffset = mediaSequence - liveSequence;
+            if (sourceSessionId) {
+                state.SessionSeqOffsets.set(sourceSessionId, sourceSeqOffset);
+            }
+        } else if (sourceSessionId && state.SessionSeqOffsets.has(sourceSessionId)) {
+            sourceSeqOffset = state.SessionSeqOffsets.get(sourceSessionId);
+        } else {
+            // Can't map this playlist to the live sequence (e.g. it only contains ad segments)
+            return textStr;
+        }
+        if (state.SeqOffset === null) {
+            state.SeqOffset = sourceSeqOffset;
+        }
+        if (sourceSeqOffset != state.LastSourceSeqOffset) {
+            if (sourceSeqOffset != state.SeqOffset) {
+                console.log('Playlist continuity: sequence offset ' + sourceSeqOffset + ' -> ' + state.SeqOffset);
+            }
+            state.LastSourceSeqOffset = sourceSeqOffset;
+        }
+        const firstSeq = mediaSequence - sourceSeqOffset + state.SeqOffset;
+        for (let i = 0; i < segments.length; i++) {
+            segments[i].Seq = firstSeq + i;
         }
         // Drop everything up to the last segment which was already given to the player under a different url (this keeps the remaining segments sequential)
         let dropCount = 0;
@@ -494,9 +531,9 @@
             console.log('Playlist continuity: holding back ' + dropCount + ' already played segments');
             return state.LastText || textStr;
         }
+        let droppedDuration = 0;
         if (dropCount > 0) {
             console.log('Playlist continuity: skipped ' + dropCount + ' already played segments');
-            let droppedDuration = 0;
             for (let i = 0; i < dropCount; i++) {
                 droppedDuration += segments[i].Duration;
                 for (let j = segments[i].Start; j <= segments[i].End; j++) {
@@ -506,18 +543,18 @@
                     }
                 }
             }
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (line === null) {
-                    continue;
-                }
-                if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
-                    lines[i] = '#EXT-X-MEDIA-SEQUENCE:' + segments[dropCount].Seq;
-                } else if (line.startsWith('#EXT-X-TWITCH-LIVE-SEQUENCE:')) {
-                    lines[i] = '#EXT-X-TWITCH-LIVE-SEQUENCE:' + (parseInt(line.substring(line.indexOf(':') + 1)) + dropCount);
-                } else if (line.startsWith('#EXT-X-TWITCH-ELAPSED-SECS:')) {
-                    lines[i] = '#EXT-X-TWITCH-ELAPSED-SECS:' + (parseFloat(line.substring(line.indexOf(':') + 1)) + droppedDuration).toFixed(3);
-                }
+        }
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line === null) {
+                continue;
+            }
+            if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+                lines[i] = '#EXT-X-MEDIA-SEQUENCE:' + segments[dropCount].Seq;
+            } else if (dropCount > 0 && line.startsWith('#EXT-X-TWITCH-LIVE-SEQUENCE:')) {
+                lines[i] = '#EXT-X-TWITCH-LIVE-SEQUENCE:' + (liveSequence + dropCount);
+            } else if (dropCount > 0 && line.startsWith('#EXT-X-TWITCH-ELAPSED-SECS:')) {
+                lines[i] = '#EXT-X-TWITCH-ELAPSED-SECS:' + (parseFloat(line.substring(line.indexOf(':') + 1)) + droppedDuration).toFixed(3);
             }
         }
         let result = lines.filter((line) => line !== null).join('\n');
