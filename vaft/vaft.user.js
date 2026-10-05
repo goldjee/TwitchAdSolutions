@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (vaft)
 // @namespace    https://github.com/pixeltris/TwitchAdSolutions
-// @version      38.1.0
+// @version      38.2.0
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @updateURL    https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
 // @downloadURL  https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
@@ -53,6 +53,8 @@
         scope.PlayerBufferingMinRepeatDelay = 8000;// Minimum delay (in milliseconds) between each pause/play (this is to avoid over pressing pause/play when there are genuine buffering problems)
         scope.PlayerBufferingPrerollCheckEnabled = false;// Enable this if you're getting an immediate pause/play/reload as you open a stream (which is causing the stream to take longer to load). One problem with this being true is that it can cause the player to get stuck in some instances requiring the user to press pause/play
         scope.PlayerBufferingPrerollCheckOffset = 5;// How far the stream need to move before doing the buffering mitigation (depends on PlayerBufferingPrerollCheckEnabled being true)
+        scope.DebugPlaylists = false;// If true this will log every playlist given to the player and every segment the player downloads (toggle with debugPlaylists() in the console)
+        scope.DebugSegmentLabels = new Map();// segment url -> where it came from
         scope.PlaylistContinuityFix = true;// If true this will avoid giving the player segments it has already played when switching between m3u8 sources (fixes repeating / stuttering audio during ads)
         scope.KeepPlaylistSessionId = true;// If true this will keep the same playlist session id when switching between m3u8 sources (depends on PlaylistContinuityFix being true)
         scope.V2API = false;
@@ -136,6 +138,7 @@
                     const pendingFetchRequests = new Map();
                     ${stripAdSegments.toString()}
                     ${ensurePlaylistContinuity.toString()}
+                    ${debugPlaylist.toString()}
                     ${getStreamUrlForResolution.toString()}
                     ${processM3U8.toString()}
                     ${hookWorkerFetch.toString()}
@@ -188,6 +191,9 @@
                         } else if (e.data.key == 'SimulateAds') {
                             SimulatedAdsDepth = e.data.value;
                             console.log('SimulatedAdsDepth: ' + SimulatedAdsDepth);
+                        } else if (e.data.key == 'DebugPlaylists') {
+                            DebugPlaylists = !DebugPlaylists;
+                            console.log('DebugPlaylists: ' + DebugPlaylists);
                         } else if (e.data.key == 'AllSegmentsAreAdSegments') {
                             AllSegmentsAreAdSegments = !AllSegmentsAreAdSegments;
                             console.log('AllSegmentsAreAdSegments: ' + AllSegmentsAreAdSegments);
@@ -245,6 +251,10 @@
         const realFetch = fetch;
         fetch = async function(url, options) {
             if (typeof url === 'string') {
+                if (DebugPlaylists && !url.trimEnd().endsWith('m3u8') && !url.includes('/channel/hls/') && !url.startsWith('data:')) {
+                    const label = DebugSegmentLabels.get(url.trimEnd());
+                    console.log('[vaft debug] fetch ' + (label || 'NOT IN ANY SERVED PLAYLIST') + ' ' + url.split('?')[0].slice(-10) + (AdSegmentCache.has(url) ? ' (replaced with blank)' : ''));
+                }
                 if (AdSegmentCache.has(url)) {
                     return new Promise(function(resolve, reject) {
                         const send = function() {
@@ -580,6 +590,39 @@
         state.LastText = result;
         return result;
     }
+    function debugPlaylist(streamInfo, url, originalText, servedText) {
+        const resolution = streamInfo.Urls[url] ? streamInfo.Urls[url].Resolution + '@' + Math.round(streamInfo.Urls[url].FrameRate) : '?';
+        const source = streamInfo.IsShowingAd ? (streamInfo.ActiveBackupPlayerType || 'main') : 'main';
+        const describe = (text, label) => {
+            const urls = [];
+            let title = '';
+            const lines = text.replaceAll('\r', '').split('\n');
+            for (const line of lines) {
+                if (line.startsWith('#EXTINF:')) {
+                    title = line.substring(line.indexOf(',') + 1);
+                } else if (line && !line.startsWith('#')) {
+                    urls.push(line.trim());
+                    DebugSegmentLabels.set(line.trim(), label + ' ' + title);
+                } else if (line.startsWith('#EXT-X-TWITCH-PREFETCH:')) {
+                    DebugSegmentLabels.set(line.substring(line.indexOf(':') + 1).trim(), label + ' prefetch');
+                } else if (line.startsWith('#EXT-X-MAP:')) {
+                    const mapUrl = line.match(/URI="([^"]+)"/);
+                    if (mapUrl) {
+                        DebugSegmentLabels.set(mapUrl[1], label + ' init');
+                    }
+                }
+            }
+            return 'MEDIA=' + (text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/) || [])[1] + ' LIVE=' + (text.match(/#EXT-X-TWITCH-LIVE-SEQUENCE:(\d+)/) || [])[1] + ' segs=' + urls.length +
+                ' prefetch=' + (text.match(/#EXT-X-TWITCH-PREFETCH:/g) || []).length + ' maps=' + (text.match(/#EXT-X-MAP:/g) || []).length + ' stitched=' + text.includes(AdSignifier) + ' last=' + title;
+        };
+        // Label the original playlist first so anything that was also served gets the served label
+        const original = describe(originalText, 'main-original(not served)');
+        const served = describe(servedText, 'served:' + source);
+        console.log('[vaft debug] ' + resolution + ' src=' + source + ' | original ' + original + ' | served ' + served);
+        while (DebugSegmentLabels.size > 3000) {
+            DebugSegmentLabels.delete(DebugSegmentLabels.keys().next().value);
+        }
+    }
     function getStreamUrlForResolution(encodingsM3u8, resolutionInfo) {
         const encodingsLines = encodingsM3u8.replaceAll('\r', '').split('\n');
         const [targetWidth, targetHeight] = resolutionInfo.Resolution.split('x').map(Number);
@@ -613,6 +656,7 @@
     }
     async function processM3U8(url, textStr, realFetch) {
         const streamInfo = StreamInfosByUrl[url];
+        const originalText = textStr;
         if (!streamInfo) {
             return textStr;
         }
@@ -780,7 +824,11 @@
             isStrippingAdSegments: streamInfo.IsStrippingAdSegments,
             numStrippedAdSegments: streamInfo.NumStrippedAdSegments
         });
-        return ensurePlaylistContinuity(streamInfo, url, textStr);
+        const result = ensurePlaylistContinuity(streamInfo, url, textStr);
+        if (DebugPlaylists) {
+            debugPlaylist(streamInfo, url, originalText, result);
+        }
+        return result;
     }
     function parseAttributes(str) {
         return Object.fromEntries(
@@ -1274,6 +1322,9 @@
             return;
         }
         postTwitchWorkerMessage('SimulateAds', depth);
+    };
+    window.debugPlaylists = () => {
+        postTwitchWorkerMessage('DebugPlaylists');
     };
     window.allSegmentsAreAdSegments = () => {
         postTwitchWorkerMessage('AllSegmentsAreAdSegments');
