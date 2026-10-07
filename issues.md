@@ -45,7 +45,9 @@ https://github.com/pixeltris/TwitchAdSolutions/blob/9cae451c04a9a94859da7de19c36
 - If you don't want to use this and would like to fix the buffering manually yourself you can set `PlayerBufferingFix` to `false`.
 - Setting `AlwaysReloadPlayerOnAd` to `true` may reduce freezing issues when entering into ads.
 
-Repeating / stuttering audio during ads (old audio playing under current video) is mitigated by `PlaylistContinuityFix`. A session with ads stitched into it numbers its segments (`EXT-X-MEDIA-SEQUENCE`) differently from the backup streams, so the script renumbers every playlist using the shared `EXT-X-TWITCH-LIVE-SEQUENCE`. It also stops the player from being given segments it has already played when the script switches between m3u8 sources. `KeepPlaylistSessionId` also keeps the playlist session id the same across those switches. If either causes problems, set it to `false`. The console logs `Playlist continuity: ...` whenever segments are skipped or held back.
+### Stuttering audio / audio from minutes ago (Firefox)
+
+When the player restarts its timeline (player reloads when entering/leaving ads, or resuming after the system paused playback, e.g. a call or removing headphones) stale audio can be left in the player's buffer, and Firefox plays pieces of it until the page is reloaded. `StaleBufferFix` removes this data automatically and logs `Removing stale buffered data` when it does. Set it to `false` to disable it.
 
 ## `video-swap-new`
 
