@@ -47,7 +47,7 @@ twitch-videoad.js text/javascript
         scope.AdSegmentCache = new Map();
         scope.AllSegmentsAreAdSegments = false;
         scope.StaleBufferFix = true;// If true this will remove stale buffered media which is left behind when the player restarts its timeline (fixes stuttering audio / audio from minutes ago on Firefox) (depends on PlayerBufferingFix being true)
-        scope.StaleBufferMargin = 3;// How far (in seconds) one track's buffer can extend past the other track's buffer before it's treated as stale
+        scope.StaleBufferMargin = 1;// Stale data is removed from this many seconds past the end of the new buffered data
     }
     let isActivelyStrippingAds = false;
     let localStorageHookFailed = false;
@@ -689,27 +689,35 @@ twitch-videoad.js text/javascript
             return realAddSourceBuffer.apply(this, arguments);
         };
     }
+    const bufferHighWater = new WeakMap();// source buffer -> furthest buffered end seen
     function removeStaleBufferedData() {
-        // When the player restarts its timeline (player reload / resuming after an external pause) it reuses the source buffers without clearing them.
-        // Old data at the same timestamps is left in one track (audio) and Firefox plays bits of it between the new audio.
-        // ponytail: assumes one stream per media source; data which is stale in every track at once isn't detected
+        // When the player restarts its timeline (player reload / resuming after an external pause / recovering from a stall) it reuses the source buffer without fully clearing it.
+        // Old audio is left past the end of the new data (hidden, as buffered only reports where both tracks have data) and Firefox plays bits of it between the new audio.
+        // A restart shows up as the buffered end jumping backwards, so when that happens remove everything past the new end.
+        // ponytail: a restart which jumps back less than 10 seconds isn't detected
         mediaSources.forEach((mediaSource) => {
             if (mediaSource.readyState === 'closed') {
                 mediaSources.delete(mediaSource);
                 return;
             }
-            const sourceBuffers = Array.from(mediaSource.sourceBuffers);
-            if (mediaSource.readyState !== 'open' || sourceBuffers.length < 2) {
+            if (mediaSource.readyState !== 'open') {
                 return;
             }
-            const ends = sourceBuffers.map((sourceBuffer) => sourceBuffer.buffered.length ? sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) : 0);
-            const staleStart = Math.min(...ends) + StaleBufferMargin;
-            sourceBuffers.forEach((sourceBuffer, i) => {
-                if (ends[i] > staleStart && !sourceBuffer.updating) {
-                    console.log('Removing stale buffered data ' + staleStart.toFixed(1) + '-' + ends[i].toFixed(1));
-                    sourceBuffer.remove(staleStart, Infinity);
+            for (const sourceBuffer of mediaSource.sourceBuffers) {
+                const buffered = sourceBuffer.buffered;
+                if (!buffered.length || sourceBuffer.updating) {
+                    continue;
                 }
-            });
+                const end = buffered.end(buffered.length - 1);
+                const highWater = bufferHighWater.get(sourceBuffer) || 0;
+                if (end < highWater - 10) {
+                    console.log('Removing stale buffered data after ' + (end + StaleBufferMargin).toFixed(1) + ' (previous end ' + highWater.toFixed(1) + ')');
+                    sourceBuffer.remove(end + StaleBufferMargin, Infinity);
+                    bufferHighWater.set(sourceBuffer, end);
+                } else {
+                    bufferHighWater.set(sourceBuffer, Math.max(highWater, end));
+                }
+            }
         });
     }
     let playerForMonitoringBuffering = null;
