@@ -47,7 +47,7 @@ https://github.com/pixeltris/TwitchAdSolutions/blob/9cae451c04a9a94859da7de19c36
 
 ### Stuttering audio / audio from minutes ago (Firefox)
 
-When the player restarts its timeline (player reloads when entering/leaving ads, or resuming after the system paused playback, e.g. a call or removing headphones) stale audio can be left in the player's buffer, and Firefox plays pieces of it until the page is reloaded. `StaleBufferFix` removes this data automatically and logs `Removing stale buffered data` when it does. Set it to `false` to disable it.
+When the player restarts its timeline (player reloads when entering/leaving ads, or resuming after the system paused playback, e.g. a call or removing headphones) stale audio can be left hidden past the end of the player's buffer, and Firefox plays pieces of it until the page is reloaded. `StaleBufferFix` removes anything past the end of the buffer every 10 seconds. Set it to `false` to disable it.
 
 ## `video-swap-new`
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (vaft)
 // @namespace    https://github.com/pixeltris/TwitchAdSolutions
-// @version      39.1.0
+// @version      39.2.0
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @updateURL    https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
 // @downloadURL  https://github.com/goldjee/TwitchAdSolutions/raw/fix/vaft-audio-continuity/vaft/vaft.user.js
@@ -57,8 +57,8 @@
         scope.IsAdStrippingEnabled = true;
         scope.AdSegmentCache = new Map();
         scope.AllSegmentsAreAdSegments = false;
-        scope.StaleBufferFix = true;// If true this will remove stale buffered media which is left behind when the player restarts its timeline (fixes stuttering audio / audio from minutes ago on Firefox) (depends on PlayerBufferingFix being true)
-        scope.StaleBufferMargin = 1;// Stale data is removed from this many seconds past the end of the new buffered data
+        scope.StaleBufferFix = true;// If true this will remove stale buffered media which is hidden past the end of the buffered data (fixes stuttering audio / audio from minutes ago on Firefox) (depends on PlayerBufferingFix being true)
+        scope.StaleBufferMargin = 1;// Data is removed from this many seconds past the end of the buffered data
     }
     let isActivelyStrippingAds = false;
     let localStorageHookFailed = false;
@@ -692,44 +692,46 @@
             });
         });
     }
-    const mediaSources = new Set();
     function hookMediaSource() {
+        // Stale audio (left by a timeline restart or a stray append) can sit past the end of the buffered data, hidden because buffered only reports where every track has data, and Firefox plays bits of it once playback reaches it.
+        // It can't be seen, so every 10 seconds remove everything past the buffered end. This runs after the player's append has finished but before the player gets its updateend, so the player never finds the source buffer busy with our removal.
+        // ponytail: a player abort() during our removal (a few ms every 10s) throws; hasn't been seen
         const realAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
         MediaSource.prototype.addSourceBuffer = function() {
-            mediaSources.add(this);
-            return realAddSourceBuffer.apply(this, arguments);
-        };
-    }
-    const bufferHighWater = new WeakMap();// source buffer -> furthest buffered end seen
-    function removeStaleBufferedData() {
-        // When the player restarts its timeline (player reload / resuming after an external pause / recovering from a stall) it reuses the source buffer without fully clearing it.
-        // Old audio is left past the end of the new data (hidden, as buffered only reports where both tracks have data) and Firefox plays bits of it between the new audio.
-        // A restart shows up as the buffered end jumping backwards, so when that happens remove everything past the new end.
-        // ponytail: a restart which jumps back less than 10 seconds isn't detected
-        mediaSources.forEach((mediaSource) => {
-            if (mediaSource.readyState === 'closed') {
-                mediaSources.delete(mediaSource);
-                return;
-            }
-            if (mediaSource.readyState !== 'open') {
-                return;
-            }
-            for (const sourceBuffer of mediaSource.sourceBuffers) {
+            const mediaSource = this;
+            const sourceBuffer = realAddSourceBuffer.apply(this, arguments);
+            let isRemovingStale = false;
+            let lastRemoveTime = 0;
+            const hideOwnEvent = (e) => {
+                if (isRemovingStale) {
+                    e.stopImmediatePropagation();
+                }
+            };
+            sourceBuffer.addEventListener('updatestart', hideOwnEvent);
+            sourceBuffer.addEventListener('update', hideOwnEvent);
+            sourceBuffer.addEventListener('updateend', (e) => {
+                if (isRemovingStale) {
+                    // Our removal finished, now give the player the updateend for its append
+                    e.stopImmediatePropagation();
+                    isRemovingStale = false;
+                    sourceBuffer.dispatchEvent(new Event('updateend'));
+                    return;
+                }
                 const buffered = sourceBuffer.buffered;
-                if (!buffered.length || sourceBuffer.updating) {
-                    continue;
+                if (lastRemoveTime > Date.now() - 10000 || !buffered.length || sourceBuffer.updating || mediaSource.readyState !== 'open' || playerForMonitoringBuffering?.state?.props?.content?.type !== 'live') {
+                    return;
                 }
-                const end = buffered.end(buffered.length - 1);
-                const highWater = bufferHighWater.get(sourceBuffer) || 0;
-                if (end < highWater - 10) {
-                    console.log('Removing stale buffered data after ' + (end + StaleBufferMargin).toFixed(1) + ' (previous end ' + highWater.toFixed(1) + ')');
-                    sourceBuffer.remove(end + StaleBufferMargin, Infinity);
-                    bufferHighWater.set(sourceBuffer, end);
-                } else {
-                    bufferHighWater.set(sourceBuffer, Math.max(highWater, end));
+                lastRemoveTime = Date.now();
+                try {
+                    sourceBuffer.remove(buffered.end(buffered.length - 1) + StaleBufferMargin, Infinity);
+                } catch {
+                    return;// The player gets its updateend as normal
                 }
-            }
-        });
+                isRemovingStale = true;
+                e.stopImmediatePropagation();
+            });
+            return sourceBuffer;
+        };
     }
     let playerForMonitoringBuffering = null;
     const playerBufferState = {
@@ -743,13 +745,6 @@
         isLive: true
     };
     function monitorPlayerBuffering() {
-        if (StaleBufferFix && playerForMonitoringBuffering?.state?.props?.content?.type === 'live') {
-            try {
-                removeStaleBufferedData();
-            } catch (err) {
-                console.error('error when removing stale buffered data: ' + err);
-            }
-        }
         if (playerForMonitoringBuffering) {
             try {
                 const player = playerForMonitoringBuffering.player;
